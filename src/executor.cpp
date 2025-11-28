@@ -31,7 +31,8 @@
 #include <sstream>
 #include <tuple>
 #include <vector>
-#include <boost/timer/timer.hpp>
+#include <chrono>
+#include <ratio>
 #include <boost/accumulators/accumulators.hpp>
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/accumulators/statistics/mean.hpp>
@@ -39,11 +40,13 @@
 #include <boost/accumulators/statistics/max.hpp>
 #include <boost/accumulators/statistics/count.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
+#include <boost/accumulators/statistics/tail_quantile.hpp>
 #include "ConsoleTable.h"
 #include "errorcodes.hpp"
 #include "p11benchmark.hpp"
 #include "measure.hpp"
 #include "executor.hpp"
+
 
 // thread sync objects
 std::mutex greenlight_mtx;
@@ -51,7 +54,6 @@ std::condition_variable greenlight_cond;
 bool greenlight = false;
 
 namespace bacc = boost::accumulators;
-constexpr double nano_to_milli = 1000000.0 ;
 
 
 ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const size_t skipiter, const std::forward_list<std::string> shortlist )
@@ -66,8 +68,8 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	std::vector<P11Benchmark *> benchmark_array(m_numthreads);
 	int last_errcode = CKR_OK;
 
-	boost::timer::cpu_timer wallclock_t;
-	nanosecond_type wallclock_elapsed { 0 }; // used to measure how much time in total was spent in executing the test
+	
+	milliseconds_double_t wallclock_elapsed { 0 }; // used to measure how much time in total was spent in executing the test
 
 	// helper functions for ConsoleTable conversion of items to string
 	auto d2s = [] (double arg, int precision=-1) -> std::string {
@@ -137,7 +139,7 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 
 	// start the wall clock
 
-	wallclock_t.start();
+	auto wallclock_1 = std::chrono::steady_clock::now();
 	// give start signal
 	{
 	    std::lock_guard<std::mutex> greenlight_lck(greenlight_mtx);
@@ -151,15 +153,20 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	}
 
 	// stop wallclock and measure elapsed time
-	wallclock_t.stop();
-	wallclock_elapsed = wallclock_t.elapsed().wall;
+	auto wallclock_2 = std::chrono::steady_clock::now();
+	wallclock_elapsed = std::chrono::duration_cast<milliseconds_double_t>(wallclock_2 - wallclock_1);
 
+	// we create one accumulator for most of the stats
 	bacc::accumulator_set< double, bacc::stats<
 	    bacc::tag::mean,
 	    bacc::tag::min,
 	    bacc::tag::max,
 	    bacc::tag::count,
-	    bacc::tag::variance > > acc;
+	    bacc::tag::variance,
+		bacc::tag::tail_quantile< bacc::right >
+		 > > acc( bacc::tag::tail<bacc::right>::cache_size = 1000 );
+
+
 
 	// helper map table for statistics
 	std::map<std::string, std::function<double()> > stats {
@@ -175,18 +182,21 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	    // note: for error, we take k=2 so 95% of measures are within interval
 	    { "error", [&stats] () { return std::sqrt(stats["svar"]()/static_cast<double>( stats["count"]() ))*2; }},
 	    { "count", [&acc] () { return bacc::count(acc); }},
+		{ "p95", [&acc] () { return bacc::quantile(acc, bacc::quantile_probability = 0.95); }},
+		{ "p98", [&acc] () { return bacc::quantile(acc, bacc::quantile_probability = 0.98); }},
+		{ "p99", [&acc] () { return bacc::quantile(acc, bacc::quantile_probability = 0.99); }}
 	};
 
 	// compute statistics
 	for(auto elapsed: elapsed_time_array) {
 	    if(elapsed.second != CKR_OK) {
-		last_errcode = elapsed.second;
-		wallclock_elapsed = 0;
+			last_errcode = elapsed.second;
+			wallclock_elapsed = milliseconds_double_t { 0 };
 		break;		// something wrong happened, no need to carry on
 	    }
 
-	    for(auto it=elapsed.first.begin(); it!=elapsed.first.end(); ++it) {
-		acc(*it/nano_to_milli);
+	    for(auto &it: elapsed.first) {
+			acc(it.count());
 	    }
 	}
 
@@ -194,7 +204,7 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	auto stats_count = stats["count"]();
 
 	// timer_res is the resolution of the timer
-	Measure<> timer_res(m_timer_res, m_timer_res_err, "ns");
+	Measure<> timer_res(m_timer_res.count(), m_timer_res_err.count(), "ns");
 	result_rows.emplace_back(std::forward_as_tuple("timer resolution", "timer resolution", std::move(timer_res)));
 
 	// epsilon represents the max resolution we have for a latency measurement.
@@ -203,7 +213,7 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	// it is multiplied by two, as an interval is measured by making two time measurements. Therefore the
 	// uncertainties adds up.
 	// It is converted to milliseconds.
-	auto epsilon = 2 * (m_timer_res + m_timer_res_err ) / nano_to_milli;
+	auto epsilon = 2 * std::chrono::duration_cast<milliseconds_double_t>(m_timer_res + m_timer_res_err).count();
 
 	// if the statistical error is less than epsilon, then it is no more significant,
 	// as the measure is blurred by the resolution of the timer.
@@ -223,6 +233,21 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	auto latency_max_err =  epsilon;
 	Measure<> latency_max(latency_max_val, latency_max_err, "ms");
 	result_rows.emplace_back(std::forward_as_tuple("latency, maximum", "latency.maximum", std::move(latency_max)));
+
+	// p95, p98, p99 quantiles
+	auto latency_p95_val = stats["p95"]();
+	auto latency_p95_err = epsilon;
+	Measure<> latency_p95(latency_p95_val, latency_p95_err, "ms");
+	result_rows.emplace_back(std::forward_as_tuple("latency, 95th percentile", "latency.p95", std::move(latency_p95)));
+	auto latency_p98_val = stats["p98"]();
+	auto latency_p98_err = epsilon;
+	Measure<> latency_p98(latency_p98_val, latency_p98_err, "ms");
+	result_rows.emplace_back(std::forward_as_tuple("latency, 98th percentile", "latency.p98", std::move(latency_p98)));
+	auto latency_p99_val = stats["p99"]();
+	auto latency_p99_err = epsilon;
+	Measure<> latency_p99(latency_p99_val, latency_p99_err, "ms");
+	result_rows.emplace_back(std::forward_as_tuple("latency, 99th percentile", "latency.p99", std::move(latency_p99)));
+
 	// TPS is the number of "transactions" per second.
 	// the meaning of "transaction" depends upon the tested API/algorithm
 
@@ -249,7 +274,7 @@ ptree Executor::benchmark( P11Benchmark &benchmark, const size_t iter, const siz
 	result_rows.emplace_back(std::forward_as_tuple("global throughput, average", "throughput.global", std::move(throughput_global_avg)));
 
 	// wallclock_elapsed_ms is the total time elapsed (in ms).
-	Measure<> wallclock_elapsed_ms( wallclock_elapsed/nano_to_milli, epsilon, "ms" );
+	Measure<> wallclock_elapsed_ms( wallclock_elapsed.count(), epsilon, "ms" );
 	result_rows.emplace_back(std::forward_as_tuple("wall clock", "wallclock", std::move(wallclock_elapsed_ms)));
 
 	ConsoleTable results{"measure", "value", "error (+/-)", "unit", "rel. error" };
