@@ -22,8 +22,29 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')  # use a non-interactive backend
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 from scipy.optimize import curve_fit
+import signal
+import sys
+import os
+
+# Global variable to track files being processed
+current_files = []
+
+
+def signal_handler(sig, frame):
+    """Handle CTRL-C gracefully by cleaning up incomplete files"""
+    print('\n\nInterrupted! Cleaning up incomplete files...', file=sys.stderr)
+    for filepath in current_files:
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                print(f'Removed incomplete file: {filepath}', file=sys.stderr)
+            except Exception as e:
+                print(f'Failed to remove {filepath}: {e}', file=sys.stderr)
+    print('Exiting.', file=sys.stderr)
+    sys.exit(0)
 
 
 def splithalf(string):
@@ -165,9 +186,11 @@ def generate_graphs(xlsfp, sheetname, xlsfp2):
                 title = "{}\n{}".format(*splithalf(title))
                 ax.set_title(title)
                 ax.set_xlabel(xlabel)
-                ax.set_ylabel(f'Throughput ({unit})')
+                ax.set_ylabel(f'Throughput ({unit})', color='tab:blue')
+                ax.tick_params(axis='y', labelcolor='tab:blue')
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
                 ax.grid('on', which='both', axis='x')
-                ax.grid('on', which='major', axis='y')
+                ax.grid('on', which='major', axis='y', linestyle='-', color='tab:blue', alpha=0.3)
 
                 ax1 = ax.twinx()  # add second plot to the same axes, sharing x-axis
                 ax1.plot(np.nan, marker='v', label=f'{measure}, global {xlsfp.label[1]}',
@@ -179,16 +202,31 @@ def generate_graphs(xlsfp, sheetname, xlsfp2):
                 ax1.plot(frame1[xvar], frame1['latency average value'], label=f'latency average {xlsfp.label[1]}',
                          color='black', marker='p')
                 
+                # Add horizontal dash-dot grid lines for latency average axis
+                ax1.grid(True, which='major', axis='y', linestyle='-.', color='black', alpha=0.3, zorder=2)
                 
-                if args.p95:
-                    ax1.plot(frame1[xvar], frame1['p95'], color='green', alpha=1.0, label=f'latency p95 {xlsfp.label[1]}', marker='1')
-                    ax1.fill_between(frame1[xvar], frame1['p95'], facecolor='grey', alpha=0.2)
-                if args.p98:
-                    ax1.plot(frame1[xvar], frame1['p98'], color='red', alpha=1.0, label=f'latency p98 {xlsfp.label[1]}', marker='2')
-                    ax1.fill_between(frame1[xvar], frame1['p98'], facecolor='grey', alpha=0.2)
-                if args.p99:
-                    ax1.plot(frame1[xvar], frame1['p99'], color='blue', alpha=1.0, label=f'latency p99 {xlsfp.label[1]}', marker='3')
-                    ax1.fill_between(frame1[xvar], frame1['p99'], facecolor='grey', alpha=0.2)            
+                
+                # Create a third y-axis for percentiles if they are enabled
+                if args.p95 or args.p98 or args.p99:
+                    ax_percentiles = ax.twinx()
+                    # Offset the third axis to the right
+                    ax_percentiles.spines['right'].set_position(('axes', 1.1))
+                    
+                    if args.p95:
+                        ax_percentiles.plot(frame1[xvar], frame1['p95'], color='plum', alpha=1.0, label=f'latency p95 {xlsfp.label[1]}', marker='1', zorder=5)
+                        ax_percentiles.fill_between(frame1[xvar], frame1['p95'], facecolor='palegreen', alpha=0.2, zorder=1)
+                    if args.p98:
+                        ax_percentiles.plot(frame1[xvar], frame1['p98'], color='mediumorchid', alpha=1.0, label=f'latency p98 {xlsfp.label[1]}', marker='2', zorder=5)
+                        ax_percentiles.fill_between(frame1[xvar], frame1['p98'], facecolor='lightgreen', alpha=0.2, zorder=1)
+                    if args.p99:
+                        ax_percentiles.plot(frame1[xvar], frame1['p99'], color='darkorchid', alpha=1.0, label=f'latency p99 {xlsfp.label[1]}', marker='3', zorder=5)
+                        ax_percentiles.fill_between(frame1[xvar], frame1['p99'], facecolor='limegreen', alpha=0.2, zorder=1)
+                    
+                    ax_percentiles.set_ylabel('Latency Percentiles (ms)', color='darkviolet')
+                    ax_percentiles.tick_params(axis='y', labelcolor='darkviolet')
+                    
+                    # Add horizontal dashed grid lines for percentile axis
+                    ax_percentiles.grid(True, which='major', axis='y', linestyle='--', color='darkviolet', alpha=0.3, zorder=2)
 
                 if not args.no_error_region:
                     ax1.plot(np.nan, label=f'{measure} error', color='tab:blue', alpha=0.4)  # Make an agent in ax
@@ -207,8 +245,26 @@ def generate_graphs(xlsfp, sheetname, xlsfp2):
                         ax1.fill_between(frame2[xvar], frame2['latency_upper'], frame2['latency_lower'],
                                          facecolor='grey', alpha=0.4, linestyle='--')
 
-                ax1.set_ylabel('Latency (ms)')
-                ax1.legend(loc='lower right')
+                ax1.set_ylabel('Latency Average (ms)')
+                
+                # Set x-axis and y-axis limits to remove margins
+                ax.set_xlim(left=frame1[xvar].min(), right=frame1[xvar].max())
+                ax.set_ylim(bottom=0)
+                ax1.set_ylim(bottom=0)
+                if args.p95 or args.p98 or args.p99:
+                    ax_percentiles.set_ylim(bottom=0)
+                
+                # Merge legends from all axes and attach to the topmost axis
+                handles1, labels1 = ax1.get_legend_handles_labels()
+                if args.p95 or args.p98 or args.p99:
+                    handles_percentiles, labels_percentiles = ax_percentiles.get_legend_handles_labels()
+                    handles1 += handles_percentiles
+                    labels1 += labels_percentiles
+                    # Attach legend to ax_percentiles (the topmost axis) instead of ax1
+                    legend = ax_percentiles.legend(handles1, labels1, loc='lower right', fancybox=False, framealpha=1.0, facecolor='white')
+                else:
+                    legend = ax1.legend(handles1, labels1, loc='lower right', fancybox=False, framealpha=1.0, facecolor='white')
+                legend.set_zorder(100)
 
                 # second subplot with tp per item
                 if args.indvar == 'threads':
@@ -244,9 +300,12 @@ def generate_graphs(xlsfp, sheetname, xlsfp2):
                     ax2.set_ylabel(f'Throughput ({unit})')
                 if args.indvar == 'size':
                     ax2.set_ylabel('Transactions/s')
+                ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+                ax2.set_xlim(left=frame1[xvar].min(), right=frame1[xvar].max())
+                ax2.set_ylim(bottom=0)
                 ax2.grid('on', which='both', axis='x')
                 ax2.grid('on', which='major', axis='y')
-                ax2.legend(loc='upper right')
+                ax2.legend(loc='upper right', fancybox=False, framealpha=1.0, facecolor='white')
 
                 # add some regression lines
                 def rline_throughput():
@@ -284,16 +343,32 @@ def generate_graphs(xlsfp, sheetname, xlsfp2):
 
                 plt.tight_layout()
                 filename = testcase.lower().replace(' ', '_')
+                
+                # Track files being created
+                global current_files
+                current_files = []
+                
                 if 'svg' in args.format or 'all' in args.format:
-                    plt.savefig(f'{filename}-{fnsub}{item}.svg', format='svg', orientation='landscape')
+                    svg_file = f'{filename}-{fnsub}{item}.svg'
+                    current_files.append(svg_file)
+                    plt.savefig(svg_file, format='svg', orientation='landscape')
                 if 'png' in args.format or 'all' in args.format:
-                    plt.savefig(f'{filename}-{fnsub}{item}.png', format='png', orientation='landscape')
+                    png_file = f'{filename}-{fnsub}{item}.png'
+                    current_files.append(png_file)
+                    plt.savefig(png_file, format='png', orientation='landscape')
+                
+                # Clear tracking after successful save
+                current_files = []
+                
                 plt.cla()
                 plt.close(fig)
                 print('OK', flush=True)
 
 
 if __name__ == '__main__':
+    # Register signal handler for CTRL-C
+    signal.signal(signal.SIGINT, signal_handler)
+    
     parser = argparse.ArgumentParser(description='Generate graphs from spreadsheet of p11perftest results')
     parser.add_argument('xls', metavar='FILE', type=argparse.FileType('rb'), help='Path to Excel spreadsheet')
     parser.add_argument('-t', '--table', help='Table name.', default=0)
