@@ -19,7 +19,19 @@
 #include <botan/p11.h>
 #include "errorcodes.hpp"
 
-const std::string errorcode(int rc) {
+
+const std::string errorcode(benchmark_result::operation_outcome_t outcome) {
+    if (std::holds_alternative<benchmark_result::Ok>(outcome)) {
+        return "CKR_OK";
+    } else if (std::holds_alternative<benchmark_result::NotFound>(outcome)) {
+        // return message from NotFound exception
+        return std::get<benchmark_result::NotFound>(outcome).what();
+    } else {
+        return errorcode( std::get<decltype(std::declval<Botan::PKCS11::PKCS11_ReturnError>().error_code())>(outcome) );
+    }
+}
+
+static const std::string errorcode(int rc) {
     switch ( rc ) {
     case CKR_OK:
 	return "CKR_OK";
